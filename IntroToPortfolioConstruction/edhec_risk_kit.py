@@ -3,6 +3,7 @@ from scipy.stats import norm
 import numpy as np
 from scipy.optimize import minimize
 import math
+
 def drawdown(return_series: pd.Series):
     """
     Takes a time series of asset returns.
@@ -18,7 +19,7 @@ def drawdown(return_series: pd.Series):
     
     return pd.DataFrame({
         'Wealth': wealth_index,
-        'Peaks': previous_peaks,
+        'Previous Peak': previous_peaks,
         'Drawdown': drawdowns
     })
 
@@ -419,7 +420,11 @@ def gbm(n_years = 10, n_scenarios=1000, mu=0.07, sigma=0.15, steps_per_year=12, 
 
 def discount(t, r):
     """
-    Compute the price of a pure discount bond that pays a dollar at time t where t is in years and r is the annual interest rate
+    Compute the price of a pure discount bond that pays a dollar at time period t
+    and r is the per-period interest rate
+    returns a |t| x |r| Series or DataFrame
+    r can be a float, Series or DataFrame
+    returns a DataFrame indexed by t
     """
     discounts = pd.DataFrame([(r+1)**-i for i in t])
     discounts.index = t
@@ -478,9 +483,9 @@ def macaulay_duration(flows, discount_rate):
     """
     Computes the Macaulay Duration of a sequence of cash flows, given a per-period discount rate
     """
-    discounted_flows = discount(flows.index, discount_rate)*flows
+    discounted_flows = discount(flows.index, discount_rate)*pd.DataFrame(flows)
     weights = discounted_flows/discounted_flows.sum()
-    return np.average(flows.index, weights=weights)
+    return np.average(flows.index, weights=weights.iloc[:,0])
 
 def match_durations(cf_t, cf_s, cf_l, discount_rate):
     """
@@ -558,3 +563,120 @@ def bond_total_return(monthly_prices, principal, coupon_rate, coupons_per_year):
     coupons.iloc[pay_date] = principal*coupon_rate/coupons_per_year
     total_returns = (monthly_prices + coupons)/monthly_prices.shift()-1
     return total_returns.dropna()
+
+
+
+def bt_mix(r1, r2, allocator, **kwargs):
+    """
+    Runs a backtest of allocatin between two sets of returns
+    r1 and r2 are T x N dataframes or returns where T is the time step index and N is the number of scenarios
+    allocator is a function that takes returns and parameters, and produces an allocation as a Tx1 dataframe
+    Returns T x N DF of resulting scenarios
+    """
+    
+    if not r1.shape == r2.shape:
+        raise ValueError('r1 and r2 need to be the same shape')
+    weights = allocator(r1, r2, **kwargs)
+    if not weights.shape == r1.shape:
+        raise ValueError('Allocator returned weights that dont match r1')
+    r_mix = weights * r1 + (1-weights) * r2
+    return r_mix
+    
+    
+def fixedmix_allocator(r1, r2, w1, **kwargs):
+    """
+    Produces a time series over T steps of allocations between PSP and GHP across N scenarios
+    PSP and GHP are TxN df of returns, each column is a scenario
+    Returns a TXN dataframe of PSP weights
+    """
+    return pd.DataFrame(data=w1, index = r1.index, columns=r1.columns)
+
+def terminal_values(rets):
+    """
+    returns final value of a dollar at the end of the return period
+    """
+    return (rets+1).prod()
+
+def terminal_stats(rets, floor = .8, cap=np.inf, name = 'Stats'):
+    terminal_wealth = (rets+1).prod()
+    breach = terminal_wealth < floor
+    reach = terminal_wealth >= cap
+    p_breach = breach.mean() if breach.sum() > 0 else np.nan
+    p_reach = reach.mean() if reach.sum() > 0 else np.nan
+    e_short = (floor-terminal_wealth[breach]).mean() if breach.sum() > 0 else np.nan
+    e_surplus = (cap-terminal_wealth[reach]).mean() if reach.sum() > 0 else np.nan
+    sum_stats = pd.DataFrame.from_dict({
+        'mean': terminal_wealth.mean(),
+        'std': terminal_wealth.std(),
+        'p_breach': p_breach,
+        'e_short': e_short,
+        'p_reach': p_reach,
+        'e_surplus': e_surplus
+    }, orient = 'index', columns = [name])
+    return sum_stats
+
+
+def glidepath_allocator(r1, r2, start_glide = 1, end_glide = 0):
+    """
+    Simulates a TDF style move from r1 to r2
+    """
+    n_points = r1.shape[0]
+    n_col = r1.shape[1]
+    path = pd.Series(data = np.linspace(start_glide, end_glide, num = n_points))
+    paths = pd.concat([path]*n_col, axis = 1)
+    paths.index = r1.index
+    paths.columns = r1.columns
+    return paths
+
+
+def floor_allocator(psp_r, ghp_r, floor, zc_prices, m=3):
+    """
+    Allocate between PSP and GHP with the goal to provide exposure to upside
+    without violating floor
+    Uses CPPI style risk budgeting to invest a multiple of cushion in PSP
+    Returns DF with same shape as psp/ghp representing weights in gsp
+    """
+    
+    if zc_prices.shape != psp_r.shape:
+        raise ValueError('Psp and ZC prices must have same shape')
+    n_steps, n_scenarios = psp_r.shape
+    account_value = np.repeat(1, n_scenarios)
+    floor_value = np.repeat(1, n_scenarios)
+    w_history = pd.DataFrame(index = psp_r.index, columns=psp_r.columns)
+    for step in range(n_steps):
+        floor_value = floor * zc_prices.iloc[step] #PV of floor assuming today's rates and flat YC
+        cushion = (account_value - floor_value) / account_value
+        psp_w = (m*cushion).clip(0,1)
+        ghp_w = 1-psp_w
+        psp_alloc = account_value * psp_w
+        ghp_alloc = account_value * ghp_w
+        #Recompute account value at end of step
+        account_value = psp_alloc * (1+psp_r.iloc[step]) + ghp_alloc*(1+ghp_r.iloc[step])
+        w_history.iloc[step] = psp_w
+    return w_history
+
+def drawdown_allocator(psp_r, ghp_r, maxdd, m=3):
+    """
+    Allocate between PSP and GHP with the goal to provide exposure to upside
+    without violating floor
+    Uses CPPI style risk budgeting to invest a multiple of cushion in PSP
+    Returns DF with same shape as psp/ghp representing weights in gsp
+    """
+    
+    n_steps, n_scenarios = psp_r.shape
+    account_value = np.repeat(1, n_scenarios)
+    floor_value = np.repeat(1, n_scenarios)
+    peak_value = np.repeat(1, n_scenarios)
+    w_history = pd.DataFrame(index = psp_r.index, columns=psp_r.columns)
+    for step in range(n_steps):
+        floor_value = (1-maxdd) * peak_value
+        cushion = (account_value - floor_value) / account_value
+        psp_w = (m*cushion).clip(0,1)
+        ghp_w = 1-psp_w
+        psp_alloc = account_value * psp_w
+        ghp_alloc = account_value * ghp_w
+        #Recompute account value at end of step
+        account_value = psp_alloc * (1+psp_r.iloc[step]) + ghp_alloc*(1+ghp_r.iloc[step])
+        peak_value = np.maximum(peak_value, account_value)
+        w_history.iloc[step] = psp_w
+    return w_history

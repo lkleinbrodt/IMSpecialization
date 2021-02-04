@@ -1,0 +1,7 @@
+{
+    "python.pythonPath": "/opt/anaconda3/envs/IMSpecialization/bin/python",
+    "python.jediEnabled": false,
+    "python.analysis.cachingLevel": "Library",
+    "python.languageServer": "Pylance",
+    "jupyter.jupyterServerType": "local"
+}
